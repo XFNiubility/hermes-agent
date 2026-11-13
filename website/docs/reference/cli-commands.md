@@ -146,7 +146,7 @@ Common options:
 | `--safe-mode` | Troubleshooting mode: disable ALL customizations — user config, rules/memory injection, plugins, shell hooks, and MCP servers (implies `--ignore-user-config` and `--ignore-rules`). The gateway freezes code defaults plus your explicit options into the session and runs the turn in an isolated worker process that never reads the profile, so a broken `config.yaml` cannot block it. Requires an explicit `--model` (there is no profile default to inherit); pair with `--provider custom --base-url <url> --api-key <key>` for a fully explicit endpoint. |
 | `--base-url <url>` / `--api-key <key>` | Explicit OpenAI-compatible endpoint and launch-only key for `--provider custom`. The key is held in the running gateway's memory for this session and never written to disk. |
 | `--source <tag>` | Session source tag for filtering (default: `cli`; one-shot runs default to `oneshot`, which pickers hide). Use `tool` for third-party integrations that should not appear in user session lists. An explicit `--source` is always stored as given, even for a one-shot run launched from inside a TUI or Desktop session. |
-| `--max-turns <N>` | Maximum tool-calling iterations per conversation turn (default: 500, or `agent.max_turns` in config). |
+| `--max-turns <N>` | Maximum tool-calling iterations per conversation turn (default: unlimited, or `agent.max_turns` in config). |
 
 Examples:
 
@@ -1106,7 +1106,7 @@ Upload a debug report (system info + recent logs) to a paste service and get a s
 | Option | Description |
 |--------|-------------|
 | `--lines <N>` | Number of log lines to include per log file (default: 200). |
-| `--expire <days>` | Paste expiry in days (default: 7). |
+| `--expire <days>` | dpaste.com fallback retention in days (minimum 1; default: 1). paste.rs pastes are always deleted after 6 hours; dpaste.com pastes cannot be deleted early. |
 | `--nous` | Upload to Nous-internal diagnostics storage instead of a public paste service. Use this when Nous support asks for a private diagnostic bundle. |
 | `--local` | Print the report locally instead of uploading. |
 | `--no-redact` | Disable upload-time secret redaction. By default, uploads are redacted. |
@@ -1120,7 +1120,7 @@ Default uploads use public paste services tried in order: paste.rs, dpaste.com. 
 ```bash
 hermes debug share              # Upload debug report, print URL
 hermes debug share --lines 500  # Include more log lines
-hermes debug share --expire 30  # Keep paste for 30 days
+hermes debug share --expire 30  # Keep a dpaste.com fallback paste for 30 days
 hermes debug share --nous       # Upload a private diagnostics bundle for Nous support
 hermes debug share --local      # Print report to terminal (no upload)
 ```
