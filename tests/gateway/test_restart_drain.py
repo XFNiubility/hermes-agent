@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import sys
 import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -214,6 +215,207 @@ async def test_request_restart_waits_for_async_delegation(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fails", ["idle_wait", "before_stop", "inside_stop"])
+async def test_restart_that_fails_before_the_stop_is_logged_and_the_next_request_runs(monkeypatch, caplog, fails):
+    """The restart task is held only on the runner, so nothing else logs its failure. Until stop() has
+    begun the gateway keeps serving: the failure is logged, admission reopens and the next request runs.
+    Once stop() has begun, the stop's own guard logs the failure and its watchdog ends the process."""
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+
+    async def stop(**_kwargs):
+        if fails == "inside_stop":
+            runner._stop_task, runner._stop_guard_entered = object(), True
+        if fails != "idle_wait":
+            raise RuntimeError("stop failed")
+    runner.stop = stop
+    if fails == "idle_wait":
+        def units(_runner):
+            raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+        monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    with caplog.at_level("ERROR", logger="gateway.run"):
+        assert runner.request_restart(detached=False, via_service=True) is True
+        await asyncio.gather(runner._restart_task, return_exceptions=True)
+    failed_before_stop = [r for r in caplog.records if "before the gateway began stopping" in r.getMessage()]
+
+    if fails == "inside_stop":
+        assert failed_before_stop == [] and runner._draining is True
+        return
+    assert len(failed_before_stop) == 1 and failed_before_stop[0].exc_info is not None
+    assert runner._draining is False and runner._restart_requested is False
+    monkeypatch.undo()
+    runner.stop = AsyncMock()
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await runner._restart_task
+    runner.stop.assert_awaited_once_with(restart=True, detached_restart=False, service_restart=True)
+
+
+@pytest.mark.asyncio
+async def test_a_restart_whose_stop_fails_before_its_guard_is_logged(monkeypatch, caplog):
+    """A stop() that raises before its teardown guard is entered (arming the watchdog can fail when the
+    unit hits its task limit) was logged by nothing: the restart task must log it."""
+    from gateway import run_shutdown
+
+    def arm_fails(*_args, **_kwargs):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(run_shutdown, "arm_shutdown_watchdog", arm_fails)
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+
+    with caplog.at_level("ERROR", logger="gateway.run"):
+        assert runner.request_restart(detached=False, via_service=True) is True
+        await asyncio.gather(runner._restart_task, return_exceptions=True)
+    logged = [r for r in caplog.records if r.exc_info and "can't start new thread" in str(r.exc_info[1])]
+    assert logged, [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_a_forced_restart_that_fails_before_the_stop_gives_the_drain_budgets_back(monkeypatch):
+    """A force zeroes both drain budgets for the stop it expects. When the restart fails before that
+    stop, the gateway keeps serving, so its later stops drain with the budgets it had before."""
+    from gateway.restart_when_idle import force_restart
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+    runner._restart_drain_timeout, runner._cron_drain_timeout = 180.0, 60.0
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    assert force_restart(runner) is True
+    await asyncio.gather(runner._restart_task, return_exceptions=True)
+    assert (runner._restart_drain_timeout, runner._cron_drain_timeout) == (180.0, 60.0)
+    assert runner._draining is False
+
+
+@pytest.mark.asyncio
+async def test_a_planned_stop_after_a_failed_service_restart_exits_cleanly(monkeypatch):
+    """The failed restart's plan is dropped with it: a later plain stop does not exit 75, which would
+    have the service manager relaunch a gateway the operator stopped."""
+    from gateway.run_shutdown import _resolve_gateway_exit_verdict
+
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+    runner._exit_with_failure, runner._exit_reason, runner._exit_code = False, None, None
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    assert runner.request_restart(detached=True, via_service=True) is True
+    await asyncio.gather(runner._restart_task, return_exceptions=True)
+    assert (runner._restart_via_service, runner._restart_detached) == (False, False)
+    assert _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown=False) is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_chat_restart_does_not_claim_the_next_restart(monkeypatch):
+    """A /restart that fails before its stop drops its requester too: the next restart (the CLI's, an
+    update's) would otherwise pass as that chat's, with no home-channel notice and no planned-restart marker."""
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+    runner._restart_command_source = make_restart_source()
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    assert runner.request_restart(detached=True, via_service=False) is True
+    await asyncio.gather(runner._restart_task, return_exceptions=True)
+    monkeypatch.undo()
+    runner.stop = AsyncMock()
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await runner._restart_task
+    assert runner._home_shutdown_broadcast_skip_reason() != "in-chat restart"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_chat_restart_leaves_no_restart_notice_for_the_next_boot(monkeypatch):
+    """/restart writes the requester's .restart_notify.json before it asks for the restart. When that
+    restart fails, the notice goes with it: the next boot would tell that chat its restart succeeded."""
+    from hermes_constants import get_hermes_home
+
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+    runner._restart_command_source = make_restart_source()
+    notice = get_hermes_home() / ".restart_notify.json"
+    notice.write_text("{}", encoding="utf-8")
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    assert runner.request_restart(detached=True, via_service=False) is True
+    await asyncio.gather(runner._restart_task, return_exceptions=True)
+    assert not notice.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_notice_that_cannot_be_removed_does_not_stop_the_recovery(monkeypatch):
+    """A read-only home makes removing the notice raise; the rest of the recovery still runs."""
+    from gateway.restart_when_idle import force_restart
+
+    class ReadOnlyHome:
+        def __truediv__(self, _name):
+            return self
+
+        def unlink(self, missing_ok=False):
+            raise PermissionError("read-only file system")
+
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+    runner._restart_command_source = make_restart_source()
+    runner._restart_drain_timeout, runner._cron_drain_timeout = 180.0, 60.0
+    monkeypatch.setattr("gateway.restart_when_idle.get_hermes_home", ReadOnlyHome)
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    assert force_restart(runner) is True
+    await asyncio.gather(runner._restart_task, return_exceptions=True)
+    assert runner._draining is False and getattr(runner, "_restart_force_event", None) is None
+    assert (runner._restart_drain_timeout, runner._cron_drain_timeout) == (180.0, 60.0)
+    assert runner._scale_to_zero_status.called
+
+
+@pytest.mark.asyncio
+async def test_a_failed_restart_keeps_an_external_drain_in_the_status(monkeypatch):
+    """While an operator's external drain refuses new turns, a restart that fails before its stop does
+    not report the gateway as running."""
+    runner, _adapter = make_restart_runner()
+    runner._scale_to_zero_status = MagicMock()
+    runner._external_drain_active = True
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await asyncio.gather(runner._restart_task, return_exceptions=True)
+    assert "running" not in [c.args[0] for c in runner._scale_to_zero_status.call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_wait_that_fails_while_another_stop_runs_is_still_logged(monkeypatch, caplog):
+    """The restart task returns quietly only for a failure raised inside its own stop() call, which the
+    stop's guard logs; a failure in the idle wait while some other stop runs is logged here."""
+    runner, _adapter = make_restart_runner()
+    runner._stop_task = object()  # a SIGTERM stop is under way
+
+    def units(_runner):
+        raise ImportError("cannot import name 'x' from 'tools.async_delegation'")
+    monkeypatch.setattr("gateway.restart_when_idle.background_units", units)
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        assert runner.request_restart(detached=False, via_service=True) is True
+        await asyncio.gather(runner._restart_task, return_exceptions=True)
+    assert [r for r in caplog.records if r.exc_info and isinstance(r.exc_info[1], ImportError)]
+
+
+@pytest.mark.asyncio
 async def test_restart_wait_never_interrupts_a_delegation_at_the_cap(monkeypatch):
     """Ruling 2026-11-13: the cap only warns; a live delegation keeps the restart waiting."""
     runner, _adapter = make_restart_runner()
@@ -383,6 +585,26 @@ async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_p
 
 @pytest.mark.platforms("windows")
 @pytest.mark.asyncio
+async def test_windows_restart_respawn_is_bound_to_this_checkout(monkeypatch):
+    """The watcher's bootstrap drops PYTHONPATH, so a bare ``python -m hermes_cli.main`` respawn
+    from a PYTHONPATH-only checkout could not import Hermes (#152714)."""
+    runner, _adapter = make_restart_runner()
+    popen_calls = []
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    import hermes_cli._subprocess_compat as subprocess_compat
+    monkeypatch.setattr(subprocess_compat, "windows_detach_popen_kwargs", dict)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: popen_calls.append(cmd) or MagicMock())
+
+    await runner._launch_detached_restart_command()
+
+    from hermes_cli._launchers import runtime_command
+    from pathlib import Path
+    respawn = runtime_command(Path(gateway_run.__file__).resolve().parent.parent, python=sys.executable)
+    assert popen_calls[0][-len(respawn) - 2:] == [*respawn, "gateway", "restart"]
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.asyncio
 async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch, tmp_path):
     """The restart watcher must run sys.executable (console python) under the
     hidden-console detach kwargs — NOT swap in GUI-subsystem pythonw.exe,
@@ -424,6 +646,47 @@ async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch
     assert cmd[0] == r"C:\venv\Scripts\python.exe"
     assert cmd[-3:] == ["hermes", "gateway", "restart"]
     assert kwargs["creationflags"] == 0x08000200
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.asyncio
+async def test_posix_detached_restart_logs_helper_output_and_exit_status(monkeypatch, tmp_path):
+    """The detached restart helper runs after the gateway exits, so a failed
+    respawn used to vanish into /dev/null: the user was told the gateway is
+    restarting and it stayed down. Its stderr and exit status must land in
+    <HERMES_HOME>/logs/detached-restart.log (#152714)."""
+    import shlex
+
+    runner, _adapter = make_restart_runner()
+    popen_calls = []
+
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append((cmd, kwargs))
+        return MagicMock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    await runner._launch_detached_restart_command()
+
+    assert len(popen_calls) == 1
+    shell_cmd = popen_calls[0][0][-1]
+    log_path = tmp_path / "logs" / "detached-restart.log"
+    assert log_path.parent.is_dir()
+    log_arg = shlex.quote(str(log_path))
+    assert "hermes gateway restart" in shell_cmd
+    assert f">> {log_arg} 2>&1" in shell_cmd
+    assert f'echo "detached restart exited with status $?" >> {log_arg}' in shell_cmd
+
+    # A log that cannot be opened must still run the helper: bash skips a command whose redirect fails.
+    monkeypatch.undo()  # the real Popen runs the probe
+    log_path.mkdir()  # a directory at the log path cannot be opened for append, even by root
+    probe = shell_cmd.replace("hermes gateway restart", "echo helper-ran")
+    out = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False)  # noqa: ASYNC221 -- the probe shell must finish before the assert
+    assert "helper-ran" in out.stdout
 
 
 # ── Shutdown notification tests ──────────────────────────────────────
